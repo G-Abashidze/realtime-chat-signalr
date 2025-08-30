@@ -1,0 +1,246 @@
+@page "/"
+@using RealtimeRooms.Client.Services
+@using RealtimeRooms.Shared.Models
+@inject RoomsApiService RoomsApi
+@inject AppStateService AppState
+@inject NavigationManager Navigation
+@inject IJSRuntime JSRuntime
+@rendermode InteractiveWebAssembly
+
+<div class="container">
+    <div class="text-center mb-3">
+        <h1>Realtime Rooms</h1>
+        <p class="text-muted">Join or create a chat room to get started</p>
+    </div>
+
+    @if (string.IsNullOrEmpty(AppState.DisplayName))
+    {
+        <div class="form-group text-center">
+            <h3>Choose Your Display Name</h3>
+            <div style="max-width: 400px; margin: 0 auto;">
+                <input @bind="displayName" @onkeypress="OnDisplayNameKeyPress" 
+                       class="form-input" placeholder="Enter your display name" />
+                <button @onclick="SaveDisplayName" class="btn btn-primary mt-2" disabled="@string.IsNullOrWhiteSpace(displayName)">
+                    Continue
+                </button>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="text-center mb-3">
+            <p>Welcome, <strong>@AppState.DisplayName</strong>!</p>
+        </div>
+
+        <div class="flex gap-4">
+            <!-- Create Room -->
+            <div class="flex-1">
+                <h3>Create a Room</h3>
+                <div class="form-group">
+                    <input @bind="newRoomName" @onkeypress="OnCreateRoomKeyPress" 
+                           class="form-input" placeholder="Room name" />
+                    <button @onclick="CreateRoom" class="btn btn-primary mt-2" disabled="@string.IsNullOrWhiteSpace(newRoomName)">
+                        Create Room
+                    </button>
+                </div>
+            </div>
+
+            <!-- Join Room -->
+            <div class="flex-1">
+                <h3>Join a Room</h3>
+                <div class="form-group">
+              <input @bind="roomIdToJoin" @onkeypress="OnJoinRoomKeyPress" 
+                  class="form-input" placeholder="Enter Room Name or ID" />
+                    <button @onclick="@(async () => await JoinRoom())" class="btn btn-secondary mt-2" disabled="@string.IsNullOrWhiteSpace(roomIdToJoin)">
+                        Join Room
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Available Rooms -->
+        <div class="mt-4">
+            <div class="flex justify-between align-items-center mb-2">
+                <h3>Available Rooms</h3>
+                <button @onclick="LoadRooms" class="btn btn-sm btn-secondary">Refresh</button>
+            </div>
+
+            @if (rooms.Any())
+            {
+                <ul class="room-list">
+                    @foreach (var room in rooms)
+                    {
+                        <li class="room-item" style="cursor: pointer;" @onclick="() => HandleRoomClick(room.RoomId)">
+                            <div class="room-name">@room.Name</div>
+                            <div class="room-id"><small>ID: @room.RoomId</small></div>
+                            <div class="room-members">@room.MemberCount member(s)</div>
+                        </li>
+                    }
+                </ul>
+            }
+            else
+            {
+                <p class="text-center text-muted">No rooms available. Create one to get started!</p>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    private string displayName = string.Empty;
+    private string newRoomName = string.Empty;
+    private string roomIdToJoin = string.Empty;
+    private List<RoomInfo> rooms = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Try to load display name from localStorage
+        try
+        {
+            // Only try localStorage on the client side
+            if (OperatingSystem.IsBrowser())
+            {
+                var savedName = await JSRuntime.InvokeAsync<string>("localStorage.getItem", "displayName");
+                if (!string.IsNullOrEmpty(savedName))
+                {
+                    AppState.DisplayName = savedName;
+                    await LoadRooms();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading display name: {ex.Message}");
+        }
+    }
+
+    private async Task SaveDisplayName()
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+            return;
+
+        AppState.DisplayName = displayName.Trim();
+        
+        // Save to localStorage
+        try
+        {
+            // Only try localStorage on the client side
+            if (OperatingSystem.IsBrowser())
+            {
+                await JSRuntime.InvokeVoidAsync("localStorage.setItem", "displayName", AppState.DisplayName);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error saving display name: {ex.Message}");
+        }
+
+        await LoadRooms();
+    }
+
+    private async Task CreateRoom()
+    {
+        if (string.IsNullOrWhiteSpace(newRoomName))
+            return;
+
+        try
+        {
+            var roomId = await RoomsApi.CreateRoomAsync(newRoomName.Trim());
+            if (!string.IsNullOrEmpty(roomId))
+            {
+                Console.WriteLine($"Navigating to chat room: {roomId}");
+                Navigation.NavigateTo($"/chat/{roomId}", forceLoad: true);
+            }
+            else
+            {
+                Console.WriteLine("Failed to create room - no room ID returned");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error creating room: {ex.Message}");
+        }
+    }
+
+
+    private async Task JoinRoom(string? roomId = null)
+    {
+        Console.WriteLine("Join room clicked");
+        var id = roomId ?? roomIdToJoin;
+        if (string.IsNullOrWhiteSpace(id))
+            return;
+
+        try
+        {
+            // Check if room exists
+            var roomsList = await RoomsApi.GetRoomsAsync();
+            Console.WriteLine($"Found {roomsList.Count} rooms in list");
+
+            // Check by Room ID first, then by Room Name
+            var targetRoom = roomsList.FirstOrDefault(r => 
+                string.Equals(r.RoomId, id, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase));
+
+            if (targetRoom != null)
+            {
+                Console.WriteLine($"Attempting to join room: {targetRoom.RoomId}");
+                Navigation.NavigateTo($"/chat/{targetRoom.RoomId}", forceLoad: true);
+            }
+            else
+            {
+                // Show error (replace with your preferred notification method)
+                Console.WriteLine($"Room does not exist: {id}");
+                Console.WriteLine($"Available rooms: {string.Join(", ", roomsList.Select(r => $"{r.Name} (ID: {r.RoomId})"))}");
+                // Optionally, display a message to the user
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error joining room: {ex.Message}");
+        }
+    }
+
+    private void HandleRoomClick(string roomId)
+    {
+        Console.WriteLine($"Room clicked: {roomId}");
+        // Direct navigation since room exists in the list
+        Navigation.NavigateTo($"/chat/{roomId}", forceLoad: true);
+    }
+
+    private async Task LoadRooms()
+    {
+        try
+        {
+            rooms = await RoomsApi.GetRoomsAsync();
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading rooms: {ex.Message}");
+        }
+    }
+
+    private async Task OnDisplayNameKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            await SaveDisplayName();
+        }
+    }
+
+    private async Task OnCreateRoomKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            await CreateRoom();
+        }
+    }
+
+    private async Task OnJoinRoomKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            await JoinRoom();
+        }
+    }
+}

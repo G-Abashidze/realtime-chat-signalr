@@ -1,0 +1,412 @@
+@page "/chat/{roomId}"
+@using RealtimeRooms.Client.Services
+@using RealtimeRooms.Shared.Models
+@inject HubClientService HubClient
+@inject RoomsApiService RoomsApi
+@inject AppStateService AppState
+@inject NavigationManager Navigation
+@inject IJSRuntime JSRuntime
+@rendermode InteractiveWebAssembly
+@implements IDisposable
+
+<div class="chat-container">
+    <!-- Header -->
+    <div class="chat-header">
+        <div>
+            <h2 class="mb-0">Room: @RoomId</h2>
+            <small class="text-muted">@AppState.CurrentUsers.Count member(s)</small>
+        </div>
+        <div class="flex gap-2">
+            <div class="connection-status @GetConnectionStatusClass()">
+                @GetConnectionStatusText()
+            </div>
+            <button @onclick="LeaveRoom" class="btn btn-secondary btn-sm">Leave Room</button>
+        </div>
+    </div>
+
+    <!-- Main chat area -->
+    <div class="chat-main">
+        <!-- Sidebar with users -->
+        <div class="chat-sidebar">
+            <h4>Members</h4>
+            <ul class="user-list">
+                @foreach (var user in AppState.CurrentUsers)
+                {
+                    <li class="user-item @(user.IsTyping ? "typing" : "")">
+                        @if (user.IsTyping)
+                        {
+                            <span class="typing-indicator"></span>
+                        }
+                        <span>@user.DisplayName</span>
+                    </li>
+                }
+            </ul>
+        </div>
+
+        <!-- Chat content -->
+        <div class="chat-content">
+            <!-- Messages -->
+            <div class="messages-container" @ref="messagesContainer">
+                @foreach (var message in AppState.Messages)
+                {
+                    <div class="message">
+                        @if (message.IsSystemMessage)
+                        {
+                            <div class="message-system">
+                                @message.Text
+                            </div>
+                        }
+                        else
+                        {
+                            var isMyMessage = message.UserId == AppState.CurrentUserId;
+                            <div class="message-user @(isMyMessage ? "message-own" : "message-other")">
+                                <div class="message-header">
+                                    <span class="message-author">@(isMyMessage ? "You" : message.DisplayName)</span>
+                                    <span class="message-time">@message.SentAtUtc.ToLocalTime().ToString("HH:mm")</span>
+                                </div>
+                                <div class="message-text">@message.Text</div>
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+
+            <!-- Typing indicator -->
+            @{
+                var typingUsers = AppState.GetTypingUsers();
+            }
+            @if (typingUsers.Any())
+            {
+                <div class="typing-indicator-container">
+                    @if (typingUsers.Count == 1)
+                    {
+                        <span>@typingUsers.First() is typing...</span>
+                    }
+                    else if (typingUsers.Count == 2)
+                    {
+                        <span>@string.Join(" and ", typingUsers) are typing...</span>
+                    }
+                    else
+                    {
+                        <span>Several people are typing...</span>
+                    }
+                </div>
+            }
+
+            <!-- Message input -->
+            <div class="message-input-container">
+                <div class="flex gap-2">
+                    <input @bind="messageText" @onkeypress="OnMessageKeyPress" @oninput="OnMessageInput"
+                           class="form-input flex-1" placeholder="Type a message..." 
+                           disabled="@(AppState.ConnectionState != ConnectionState.Connected)" />
+                    <button @onclick="SendMessage" class="btn btn-primary" 
+                            disabled="@(string.IsNullOrWhiteSpace(messageText) || AppState.ConnectionState != ConnectionState.Connected)">
+                        Send
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Toast notifications -->
+<div class="toast-container">
+    @foreach (var toast in toasts)
+    {
+        <div class="toast toast-@toast.Type.ToString().ToLower()">
+            @toast.Message
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public string RoomId { get; set; } = string.Empty;
+
+    private string messageText = string.Empty;
+    private ElementReference messagesContainer;
+    private List<ToastNotification> toasts = new();
+    private Timer? typingTimer;
+    private bool isTyping = false;
+    private DateTime lastTypingTime = DateTime.MinValue;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Check if user has a display name
+        @* if (string.IsNullOrEmpty(AppState.DisplayName))
+        {
+            Navigation.NavigateTo("/");
+            return;
+        } *@
+
+        // Set current room
+        AppState.CurrentRoomId = RoomId;
+        
+        // Clear previous room state
+        AppState.ClearRoomState();
+        AppState.CurrentRoomId = RoomId;
+
+        // Register for state changes
+        AppState.OnStateChanged += OnStateChanged;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && OperatingSystem.IsBrowser())
+        {
+            // Register for hub events
+            RegisterHubEvents();
+
+            try
+            {
+                // Connect to hub
+                await HubClient.ConnectAsync(Navigation.BaseUri);
+                
+                // Load message history
+                var messages = await RoomsApi.GetMessageHistoryAsync(RoomId);
+                AppState.SetMessageHistory(messages);
+
+                // Join the room
+                var displayName = AppState.DisplayName;
+                @* if (string.IsNullOrWhiteSpace(displayName))
+                {
+                    Console.WriteLine("No display name found, redirecting to home");
+                    Navigation.NavigateTo("/");
+                    return;
+                } *@
+                
+                Console.WriteLine($"Joining room {RoomId} with display name {displayName}");
+                await HubClient.JoinRoomAsync(RoomId, displayName);
+
+                // Force presence update after joining
+                // Wait briefly to allow server to process join
+                await Task.Delay(200);
+                Console.WriteLine($"Current users count after join: {AppState.CurrentUsers.Count}");
+                // Optionally, you could trigger a presence fetch if supported by the server
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error initializing chat: {ex.Message}");
+                ShowToast("Failed to connect to chat", ToastType.Error);
+            }
+        }
+    }
+
+    private void RegisterHubEvents()
+    {
+        HubClient.OnConnected += () =>
+        {
+            AppState.ConnectionState = ConnectionState.Connected;
+            ShowToast("Connected", ToastType.Success);
+        };
+
+        HubClient.OnDisconnected += () =>
+        {
+            AppState.ConnectionState = ConnectionState.Disconnected;
+            ShowToast("Disconnected", ToastType.Warning);
+        };
+
+        HubClient.OnReconnecting += () =>
+        {
+            AppState.ConnectionState = ConnectionState.Reconnecting;
+            ShowToast("Reconnecting...", ToastType.Info);
+        };
+
+        HubClient.OnReconnected += () =>
+        {
+            AppState.ConnectionState = ConnectionState.Connected;
+            ShowToast("Reconnected", ToastType.Success);
+        };
+
+        HubClient.OnMessageReceived += (message) =>
+        {
+            AppState.AddMessage(message);
+            InvokeAsync(ScrollToBottom);
+        };
+
+        HubClient.OnPresenceUpdated += (presence) =>
+        {
+            Console.WriteLine($"Presence updated received: {presence.Users.Count} users");
+            AppState.UpdatePresence(presence);
+        };
+
+        HubClient.OnTypingUpdated += (userId, isTyping) =>
+        {
+            AppState.UpdateTypingStatus(userId, isTyping);
+        };
+
+        HubClient.OnError += (error) =>
+        {
+            ShowToast(error, ToastType.Error);
+        };
+
+        HubClient.OnUserIdAssigned += (userId) =>
+        {
+            Console.WriteLine($"User ID assigned: {userId}");
+            AppState.CurrentUserId = userId;
+        };
+    }
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(messageText) || AppState.ConnectionState != ConnectionState.Connected)
+            return;
+
+        try
+        {
+            await HubClient.SendMessageAsync(RoomId, messageText.Trim());
+            messageText = string.Empty;
+            await StopTyping();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error sending message: {ex.Message}");
+            ShowToast("Failed to send message", ToastType.Error);
+        }
+    }
+
+    private async Task OnMessageKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey)
+        {
+            await SendMessage();
+        }
+    }
+
+    private async Task OnMessageInput(ChangeEventArgs e)
+    {
+        messageText = e.Value?.ToString() ?? string.Empty;
+        
+        if (!string.IsNullOrWhiteSpace(messageText))
+        {
+            await StartTyping();
+        }
+        else
+        {
+            await StopTyping();
+        }
+    }
+
+    private async Task StartTyping()
+    {
+        var now = DateTime.Now;
+        
+        // Throttle typing notifications to at most once per second
+        if (!isTyping || (now - lastTypingTime).TotalSeconds >= 1)
+        {
+            isTyping = true;
+            lastTypingTime = now;
+            await HubClient.SetTypingAsync(RoomId, true);
+        }
+
+        // Reset the timer to stop typing after 3 seconds of inactivity
+        typingTimer?.Dispose();
+        typingTimer = new Timer(async _ => await StopTyping(), null, TimeSpan.FromSeconds(3), Timeout.InfiniteTimeSpan);
+    }
+
+    private async Task StopTyping()
+    {
+        if (isTyping)
+        {
+            isTyping = false;
+            await HubClient.SetTypingAsync(RoomId, false);
+        }
+        typingTimer?.Dispose();
+        typingTimer = null;
+    }
+
+    private async Task LeaveRoom()
+    {
+        try
+        {
+            await HubClient.LeaveRoomAsync(RoomId);
+            await HubClient.DisconnectAsync();
+            AppState.ClearRoomState();
+            Navigation.NavigateTo("/");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error leaving room: {ex.Message}");
+        }
+    }
+
+    private async Task ScrollToBottom()
+    {
+        try
+        {
+            // Only try JavaScript interop on the client side
+            if (OperatingSystem.IsBrowser())
+            {
+                await Task.Delay(50); // Give the DOM time to update
+                await JSRuntime.InvokeVoidAsync("scrollToBottom", messagesContainer);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error scrolling to bottom: {ex.Message}");
+        }
+    }
+
+    private void OnStateChanged()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    private string GetConnectionStatusClass()
+    {
+        return AppState.ConnectionState switch
+        {
+            ConnectionState.Connected => "status-connected",
+            ConnectionState.Connecting => "status-connecting",
+            ConnectionState.Reconnecting => "status-reconnecting",
+            _ => "status-disconnected"
+        };
+    }
+
+    private string GetConnectionStatusText()
+    {
+        return AppState.ConnectionState switch
+        {
+            ConnectionState.Connected => "Connected",
+            ConnectionState.Connecting => "Connecting...",
+            ConnectionState.Reconnecting => "Reconnecting...",
+            _ => "Disconnected"
+        };
+    }
+
+    private void ShowToast(string message, ToastType type)
+    {
+        var toast = new ToastNotification { Message = message, Type = type };
+        toasts.Add(toast);
+        InvokeAsync(StateHasChanged);
+
+        // Remove toast after 3 seconds
+        _ = Task.Delay(3000).ContinueWith(_ =>
+        {
+            toasts.Remove(toast);
+            InvokeAsync(StateHasChanged);
+        });
+    }
+
+    public void Dispose()
+    {
+        AppState.OnStateChanged -= OnStateChanged;
+        typingTimer?.Dispose();
+        
+        // Don't dispose HubClient here as it's a scoped service
+        // It will be disposed by the DI container
+    }
+
+    private class ToastNotification
+    {
+        public string Message { get; set; } = string.Empty;
+        public ToastType Type { get; set; }
+    }
+
+    private enum ToastType
+    {
+        Success,
+        Info,
+        Warning,
+        Error
+    }
+}
