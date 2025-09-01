@@ -9,6 +9,8 @@
 @rendermode InteractiveWebAssembly
 @implements IDisposable
 
+@using System.Text.Json
+
 <div class="chat-container">
     <!-- Header -->
     <div class="chat-header">
@@ -138,8 +140,6 @@
             return;
         } *@
 
-        // Set current room
-        AppState.CurrentRoomId = RoomId;
         
         // Clear previous room state
         AppState.ClearRoomState();
@@ -173,7 +173,7 @@
                     Navigation.NavigateTo("/");
                     return;
                 } *@
-                
+
                 Console.WriteLine($"Joining room {RoomId} with display name {displayName}");
                 await HubClient.JoinRoomAsync(RoomId, displayName);
 
@@ -254,6 +254,7 @@
         try
         {
             await HubClient.SendMessageAsync(RoomId, messageText.Trim());
+            Console.WriteLine(JsonSerializer.Serialize(AppState));
             messageText = string.Empty;
             await StopTyping();
         }
